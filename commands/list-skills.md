@@ -9,7 +9,7 @@ You are listing every installed Claude Code skill as a discovery tool, not a dir
 ## Output rules
 
 1. Run the bash script below. It prints **native markdown** — real `##` headers, real `**bold**`, emoji icons, plain bullet lists.
-2. **Do NOT wrap the output in a fenced code block.** Relay the bash stdout to the user as your response text directly so chat renders it as formatted markdown (real headers, real bold, real emoji).
+2. **Do NOT wrap the output in a fenced code block.** Relay the bash stdout to the user as your response text directly so chat renders it as formatted markdown.
 3. Do not add any commentary above or below — the script is self-contained.
 4. If a filter argument was passed and zero skills matched, the script prints a "No skills matched" line; pass that through unchanged.
 
@@ -17,61 +17,207 @@ You are listing every installed Claude Code skill as a discovery tool, not a dir
 
 ```bash
 FILTER="$1"
+CACHE_DIR="$HOME/.cache/list-skills"
+CACHE_TSV="$CACHE_DIR/cache.tsv"
+CACHE_SUM="$CACHE_DIR/checksum.txt"
+mkdir -p "$CACHE_DIR"
 
 # ── Data flow ────────────────────────────────────────────────────────
+# v4.1 — single-awk parser + mtime cache
 #
-# /list-skills [filter]
-#         │
-#         ├─► branch_suggestion()  ─┐
-#         ├─► recently_used_raw() ──┤  Header block
-#         │                         │
-#         ▼                         ▼
-#  for each SKILL.md (3 scopes):
-#    parse_skill -> name, desc
-#    match($FILTER)
-#    classify_intent -> bucket
-#    plugin_dedup (plugin scope)
-#         │
-#         ▼
-#  Group by intent bucket -> emit markdown (no fence)
+# Cold path (~250ms target):
+#   find paths → checksum → ONE awk parses+extracts triggers across all
+#   files → bash classifies → plugin dedup → emit markdown
 #
+# Warm path (<100ms target):
+#   checksum unchanged → load cache.tsv directly → skip parser
 # ─────────────────────────────────────────────────────────────────────
 
-# === parse_skill: YAML frontmatter parser ===
-parse_skill() {
-  local file="$1"
-  local fallback
-  fallback=$(basename "$(dirname "$file")")
-  awk -v fb="$fallback" '
-    BEGIN { fm=0; in_block=0; name=""; desc="" }
-    /^---[[:space:]]*$/ { if (fm == 0) { fm=1 } else { exit } next }
-    fm == 0 { next }
-    {
-      if (in_block) {
-        if (/^[A-Za-z_][A-Za-z0-9_-]*:/) { in_block = 0 }
-        else { line=$0; sub(/^[[:space:]]+/, "", line); if (line!="") desc = (desc=="" ? line : desc " " line); next }
+# === Collect SKILL.md paths with scope tags (3 finds in parallel) ===
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+PATHS_TSV="$TMP/paths.tsv"
+
+{
+  find ~/.claude/skills -maxdepth 3 -name SKILL.md -type f 2>/dev/null \
+    | awk '{print "personal\t" $0 "\t-"}' &
+  find .claude/skills -maxdepth 3 -name SKILL.md -type f 2>/dev/null \
+    | awk '{print "project\t" $0 "\t-"}' &
+  find ~/.claude/plugins -maxdepth 6 -name SKILL.md -type f 2>/dev/null \
+    | awk '{
+        plugin=$0
+        sub(/.*\/plugins\//, "", plugin)
+        sub(/\/.*/, "", plugin)
+        print "plugin\t" $0 "\t" plugin
+      }' &
+  wait
+} | sort -t$'\t' -k2 > "$PATHS_TSV"
+
+# === Compute file-set checksum (path:mtime pairs) ===
+checksum_files() {
+  if [ ! -s "$PATHS_TSV" ]; then echo "empty"; return; fi
+  awk -F'\t' '{print $2}' "$PATHS_TSV" \
+    | xargs stat -f '%N:%m' 2>/dev/null \
+    | sort \
+    | shasum -a 1 2>/dev/null \
+    | awk '{print $1}'
+}
+CURRENT_SUM=$(checksum_files)
+
+# === Cache hit: load directly, skip parser ===
+CACHE_HIT=0
+if [ -f "$CACHE_SUM" ] && [ -f "$CACHE_TSV" ]; then
+  STORED_SUM=$(cat "$CACHE_SUM" 2>/dev/null)
+  if [ "$STORED_SUM" = "$CURRENT_SUM" ] && [ -n "$CURRENT_SUM" ]; then
+    CACHE_HIT=1
+  fi
+fi
+
+PARSED_TSV="$TMP/parsed.tsv"
+
+if [ "$CACHE_HIT" = "1" ]; then
+  cp "$CACHE_TSV" "$PARSED_TSV"
+else
+  # === Cold path: ONE awk pass parses ALL files + extracts triggers ===
+  # Reads scope/plugin lookup from PATHS_TSV via BEGIN block, then
+  # opens each SKILL.md via getline. One subprocess for the whole job.
+  awk -F'\t' -v paths_file="$PATHS_TSV" '
+    BEGIN {
+      while ((getline line < paths_file) > 0) {
+        split(line, p, "\t")
+        scope_of[p[2]] = p[1]
+        plugin_of[p[2]] = p[3]
       }
-      if (/^name:/) { line=$0; sub(/^name:[[:space:]]*/, "", line); gsub(/^"|"$|^'\''|'\''$/, "", line); name=line }
-      else if (/^description:/) {
-        line=$0; sub(/^description:[[:space:]]*/, "", line)
-        if (line=="|" || line==">" || line=="|-" || line==">-" || line=="|+" || line==">+") { in_block=1; desc="" }
-        else { gsub(/^"|"$|^'\''|'\''$/, "", line); desc=line }
-      }
+      close(paths_file)
     }
-    END {
-      if (name=="") name=fb
-      if (desc=="") desc="(no description)"
-      gsub(/[[:space:]]+/, " ", desc); sub(/^ /, "", desc); sub(/ $/, "", desc)
-      printf "%s\t%s\n", name, desc
-    }' "$file"
+    {
+      file = $2
+      scope = $1
+      plugin = $3
+
+      # Reset per-file state
+      fm = 0; in_block = 0; name = ""; desc = ""
+
+      while ((getline line < file) > 0) {
+        if (line ~ /^---[[:space:]]*$/) {
+          if (fm == 0) { fm = 1; continue } else { break }
+        }
+        if (fm == 0) continue
+
+        if (in_block) {
+          if (line ~ /^[A-Za-z_][A-Za-z0-9_-]*:/) {
+            in_block = 0
+          } else {
+            sub(/^[[:space:]]+/, "", line)
+            if (line != "") desc = (desc == "" ? line : desc " " line)
+            continue
+          }
+        }
+
+        if (line ~ /^name:/) {
+          sub(/^name:[[:space:]]*/, "", line)
+          gsub(/^"|"$|^'\''|'\''$/, "", line)
+          name = line
+        } else if (line ~ /^description:/) {
+          sub(/^description:[[:space:]]*/, "", line)
+          if (line == "|" || line == ">" || line == "|-" || line == ">-" || line == "|+" || line == ">+") {
+            in_block = 1; desc = ""
+          } else {
+            gsub(/^"|"$|^'\''|'\''$/, "", line)
+            desc = line
+          }
+        }
+      }
+      close(file)
+
+      if (name == "") {
+        # Fallback to dirname of file
+        n = split(file, parts, "/")
+        name = parts[n-1]
+      }
+      if (desc == "") desc = "(no description)"
+
+      # Collapse whitespace in desc
+      gsub(/[[:space:]]+/, " ", desc)
+      sub(/^ /, "", desc); sub(/ $/, "", desc)
+
+      # Extract trigger chips inline: pull quoted phrases from "Use when..." sentence
+      trigger = ""
+      desc_lower = tolower(desc)
+      if (match(desc_lower, /use when [^.]*/)) {
+        sentence = substr(desc, RSTART, RLENGTH)
+        # Find up to 5 quoted phrases
+        n_trig = 0
+        rest = sentence
+        while (match(rest, /"[^"]+"/) && n_trig < 5) {
+          phrase = substr(rest, RSTART + 1, RLENGTH - 2)
+          trigger = (trigger == "" ? phrase : trigger ", " phrase)
+          rest = substr(rest, RSTART + RLENGTH)
+          n_trig++
+        }
+      }
+
+      # Use "-" placeholder for empty trigger so bash read doesnt collapse adjacent tabs
+      if (trigger == "") trigger = "-"
+      printf "%s\t%s\t%s\t%s\t%s\n", name, desc, trigger, scope, plugin
+    }
+  ' "$PATHS_TSV" > "$PARSED_TSV"
+
+  # === Update cache ===
+  cp "$PARSED_TSV" "$CACHE_TSV" 2>/dev/null
+  echo "$CURRENT_SUM" > "$CACHE_SUM" 2>/dev/null
+fi
+
+# === Filter (post-cache so cache stays universal) ===
+match_filter() {
+  [ -z "$FILTER" ] && return 0
+  printf '%s' "$1" | grep -iqF "$FILTER"
 }
 
-# === classify_intent: name + desc -> bucket ===
+FILTERED_TSV="$TMP/filtered.tsv"
+: > "$FILTERED_TSV"
+INSTALLED_NAMES="$TMP/installed_names"
+: > "$INSTALLED_NAMES"
+
+while IFS=$'\t' read -r name desc trigger scope plugin; do
+  echo "$name" >> "$INSTALLED_NAMES"
+  if match_filter "$name	$desc"; then
+    printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$desc" "$trigger" "$scope" "$plugin" >> "$FILTERED_TSV"
+  fi
+done < "$PARSED_TSV"
+
+# === Plugin dedupe ===
+DEDUPED_TSV="$TMP/deduped.tsv"
+: > "$DEDUPED_TSV"
+
+# Personal/project pass through
+awk -F'\t' '$4 == "personal" || $4 == "project"' "$FILTERED_TSV" >> "$DEDUPED_TSV"
+
+# Plugin dedupe by (name, substr(desc,1,100))
+awk -F'\t' '
+  $4 == "plugin" {
+    name = $1; desc = $2; trigger = $3; plugin = $5
+    key = name "|" substr(desc, 1, 100)
+    if (key in firstdesc) {
+      plugins[key] = plugins[key] ", " plugin
+    } else {
+      firstname[key] = name
+      firstdesc[key] = desc
+      firsttrig[key] = trigger
+      plugins[key] = plugin
+    }
+  }
+  END {
+    for (k in firstname) {
+      printf "%s\t%s\t%s\tplugin\t%s\n", firstname[k], firstdesc[k], firsttrig[k], plugins[k]
+    }
+  }
+' "$FILTERED_TSV" >> "$DEDUPED_TSV"
+
+# === Classify (bash case, fast — no subprocess per skill) ===
 classify_intent() {
   local name="$1"
   local desc="$2"
-
-  # Explicit name mappings (highest precision). Order matters within a case branch.
   case "$name" in
     ship|land-and-deploy|canary|deploy|deployments-cicd|setup-deploy|next-upgrade|gstack-upgrade|release|document-release)
       echo "shipping"; return ;;
@@ -93,7 +239,6 @@ classify_intent() {
       echo "other"; return ;;
   esac
 
-  # Keyword fallback on description (lower precision).
   local d
   d=$(printf '%s' "$desc" | tr '[:upper:]' '[:lower:]')
   case "$d" in
@@ -108,7 +253,6 @@ classify_intent() {
   echo "other"
 }
 
-# === bucket_label: bucket key -> emoji + display name ===
 bucket_label() {
   case "$1" in
     shipping)  echo "🚀 Shipping & deploying" ;;
@@ -123,18 +267,16 @@ bucket_label() {
   esac
 }
 
-# === extract_trigger: pull "Use when..." chips from description ===
-extract_trigger() {
-  local desc="$1"
-  local sentence
-  sentence=$(printf '%s' "$desc" | grep -oiE 'use when [^.]*' 2>/dev/null | head -1)
-  [ -z "$sentence" ] && return
-  local triggers
-  triggers=$(printf '%s' "$sentence" | grep -oE '"[^"]*"' 2>/dev/null | head -5 | tr -d '"' | paste -sd ',' - 2>/dev/null | sed 's/,/, /g')
-  [ -n "$triggers" ] && printf '%s' "$triggers"
-}
+CLASSIFIED_TSV="$TMP/classified.tsv"
+: > "$CLASSIFIED_TSV"
+while IFS=$'\t' read -r name desc trigger scope plugin; do
+  bucket=$(classify_intent "$name" "$desc")
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$bucket" "$name" "$desc" "$trigger" "$scope" "$plugin" >> "$CLASSIFIED_TSV"
+done < "$DEDUPED_TSV"
 
-# === branch_suggestion: current branch verb -> suggested skills ===
+TOTAL_COUNT=$(wc -l < "$CLASSIFIED_TSV" | tr -d ' ')
+
+# === Branch suggestion ===
 branch_suggestion() {
   local branch
   branch=$(git branch --show-current 2>/dev/null)
@@ -148,21 +290,20 @@ branch_suggestion() {
     refactor)             printf '%s|%s' "$branch" "/review · /plan-eng-review" ;;
   esac
 }
+BS=$(branch_suggestion)
 
-# === recently_used_raw: top 5 recent skills from telemetry ===
+# === Recently used (bounded read + jq filter + intersect with installed) ===
 recently_used_raw() {
   local tel="$HOME/.gstack/analytics/skill-usage.jsonl"
   [ ! -f "$tel" ] && return
   [ ! -s "$tel" ] && return
   command -v jq >/dev/null 2>&1 || return
-
   tail -n 5000 "$tel" 2>/dev/null \
     | jq -r 'select(.skill != null and .ts != null) | "\(.skill)\t\(.ts)"' 2>/dev/null \
     | sort -k2 -r \
     | awk -F'\t' '!seen[$1]++ {print; if (++count==5) exit}'
 }
 
-# === relative_time: ISO 8601 -> "Nm/h/d ago" ===
 relative_time() {
   local iso="$1"
   local then now diff
@@ -175,87 +316,6 @@ relative_time() {
   fi
 }
 
-# === match: filter helper ===
-match() {
-  [ -z "$FILTER" ] && return 0
-  printf '%s' "$1" | grep -iqF "$FILTER"
-}
-
-# === Main ===
-
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
-
-ALL="$TMP/all"
-INSTALLED_NAMES="$TMP/installed_names"
-: > "$ALL"; : > "$INSTALLED_NAMES"
-
-# Personal scope
-while IFS= read -r f; do
-  parsed=$(parse_skill "$f")
-  match "$parsed" || continue
-  printf '%s\tpersonal\t-\n' "$parsed" >> "$ALL"
-  printf '%s\n' "$parsed" | cut -f1 >> "$INSTALLED_NAMES"
-done < <(find ~/.claude/skills -maxdepth 3 -name SKILL.md -type f 2>/dev/null | sort)
-
-# Project scope
-while IFS= read -r f; do
-  parsed=$(parse_skill "$f")
-  match "$parsed" || continue
-  printf '%s\tproject\t-\n' "$parsed" >> "$ALL"
-  printf '%s\n' "$parsed" | cut -f1 >> "$INSTALLED_NAMES"
-done < <(find .claude/skills -maxdepth 3 -name SKILL.md -type f 2>/dev/null | sort)
-
-# Plugin scope
-while IFS= read -r f; do
-  plugin=$(printf '%s' "$f" | sed -E 's|.*/plugins/([^/]+)/.*|\1|')
-  parsed=$(parse_skill "$f")
-  match "$parsed" || continue
-  printf '%s\tplugin\t%s\n' "$parsed" "$plugin" >> "$ALL"
-  printf '%s\n' "$parsed" | cut -f1 >> "$INSTALLED_NAMES"
-done < <(find ~/.claude/plugins -maxdepth 6 -name SKILL.md -type f 2>/dev/null | sort)
-
-# Plugin dedupe: same name + same first-100-chars-of-desc -> collapse, list registries.
-DEDUPED="$TMP/deduped"
-: > "$DEDUPED"
-
-# Personal/project pass through
-awk -F'\t' '$3 == "personal" || $3 == "project"' "$ALL" >> "$DEDUPED"
-
-# Plugin dedupe by (name, substr(desc,1,100))
-awk -F'\t' '
-  $3 == "plugin" {
-    name = $1; desc = $2; plugin = $4
-    key = name "|" substr(desc, 1, 100)
-    if (key in firstdesc) {
-      plugins[key] = plugins[key] ", " plugin
-    } else {
-      firstname[key] = name
-      firstdesc[key] = desc
-      plugins[key] = plugin
-    }
-  }
-  END {
-    for (k in firstname) {
-      printf "%s\t%s\tplugin\t%s\n", firstname[k], firstdesc[k], plugins[k]
-    }
-  }
-' "$ALL" >> "$DEDUPED"
-
-TOTAL_COUNT=$(wc -l < "$DEDUPED" | tr -d ' ')
-
-# Classify
-CLASSIFIED="$TMP/classified"
-: > "$CLASSIFIED"
-while IFS=$'\t' read -r name desc scope plugins; do
-  bucket=$(classify_intent "$name" "$desc")
-  printf '%s\t%s\t%s\t%s\t%s\n' "$bucket" "$name" "$desc" "$scope" "$plugins" >> "$CLASSIFIED"
-done < "$DEDUPED"
-
-# Branch suggestion
-BS=$(branch_suggestion)
-
-# Recently used (intersected with installed names to suppress stale entries)
 RU=""
 RU_RAW=$(recently_used_raw)
 if [ -n "$RU_RAW" ] && [ -s "$INSTALLED_NAMES" ]; then
@@ -306,7 +366,7 @@ BUCKETS="shipping debug design planning writing ai workflow analytics other"
 OTHER_COUNT=0
 
 for bucket in $BUCKETS; do
-  count=$(awk -F'\t' -v b="$bucket" '$1 == b' "$CLASSIFIED" | wc -l | tr -d ' ')
+  count=$(awk -F'\t' -v b="$bucket" '$1 == b' "$CLASSIFIED_TSV" | wc -l | tr -d ' ')
   [ "$count" -eq 0 ] && continue
 
   if [ "$bucket" = "other" ]; then
@@ -315,22 +375,19 @@ for bucket in $BUCKETS; do
 
   printf '## %s · %s\n\n' "$(bucket_label "$bucket")" "$count"
 
-  awk -F'\t' -v b="$bucket" '$1 == b' "$CLASSIFIED" \
+  awk -F'\t' -v b="$bucket" '$1 == b' "$CLASSIFIED_TSV" \
     | sort -t$'\t' -k2,2 \
-    | while IFS=$'\t' read -r _ name desc scope plugins; do
-        # Truncate long descriptions (markdown handles wrap, but we cap for readability)
+    | while IFS=$'\t' read -r _ name desc trigger scope plugin; do
         if [ ${#desc} -gt 140 ]; then
           desc="${desc:0:139}…"
         fi
 
-        trigger=$(extract_trigger "$desc")
-
         plugin_badge=""
-        if [ "$scope" = "plugin" ] && [ -n "$plugins" ] && [ "$plugins" != "-" ]; then
-          plugin_badge=" *(via: ${plugins})*"
+        if [ "$scope" = "plugin" ] && [ -n "$plugin" ] && [ "$plugin" != "-" ]; then
+          plugin_badge=" *(via: ${plugin})*"
         fi
 
-        if [ -n "$trigger" ]; then
+        if [ -n "$trigger" ] && [ "$trigger" != "-" ]; then
           printf -- '- **`/%s`** — %s%s · *Use when: %s*\n' "$name" "$desc" "$plugin_badge" "$trigger"
         else
           printf -- '- **`/%s`** — %s%s\n' "$name" "$desc" "$plugin_badge"
