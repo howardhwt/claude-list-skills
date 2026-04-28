@@ -20,7 +20,24 @@ FILTER="$1"
 CACHE_DIR="$HOME/.cache/list-skills"
 CACHE_TSV="$CACHE_DIR/cache.tsv"
 CACHE_SUM="$CACHE_DIR/checksum.txt"
+CACHE_TTL="${LIST_SKILLS_TTL:-60}"   # seconds; 0 disables fast-path
 mkdir -p "$CACHE_DIR"
+
+# === TTL fast-path: if cache is fresh, skip find+checksum+parser entirely ===
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+PARSED_TSV="$TMP/parsed.tsv"
+CACHE_HIT=0
+
+if [ "$CACHE_TTL" -gt 0 ] && [ -f "$CACHE_TSV" ]; then
+  cache_mtime=$(stat -f %m "$CACHE_TSV" 2>/dev/null || echo 0)
+  now=$(date +%s)
+  age=$(( now - cache_mtime ))
+  if [ "$age" -ge 0 ] && [ "$age" -lt "$CACHE_TTL" ] && [ -s "$CACHE_TSV" ]; then
+    cp "$CACHE_TSV" "$PARSED_TSV"
+    CACHE_HIT=1
+  fi
+fi
 
 # ── Data flow ────────────────────────────────────────────────────────
 # v4.1 — single-awk parser + mtime cache
@@ -33,11 +50,10 @@ mkdir -p "$CACHE_DIR"
 #   checksum unchanged → load cache.tsv directly → skip parser
 # ─────────────────────────────────────────────────────────────────────
 
-# === Collect SKILL.md paths with scope tags (3 finds in parallel) ===
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+# === Cold path: skipped if TTL fast-path already populated PARSED_TSV ===
 PATHS_TSV="$TMP/paths.tsv"
 
+if [ "$CACHE_HIT" != "1" ]; then
 {
   find ~/.claude/skills -maxdepth 3 -name SKILL.md -type f 2>/dev/null \
     | awk '{print "personal\t" $0 "\t-"}' &
@@ -53,7 +69,7 @@ PATHS_TSV="$TMP/paths.tsv"
   wait
 } | sort -t$'\t' -k2 > "$PATHS_TSV"
 
-# === Compute file-set checksum (path:mtime pairs) ===
+# === Checksum-based cache validation (when TTL expired but content unchanged) ===
 checksum_files() {
   if [ ! -s "$PATHS_TSV" ]; then echo "empty"; return; fi
   awk -F'\t' '{print $2}' "$PATHS_TSV" \
@@ -64,8 +80,6 @@ checksum_files() {
 }
 CURRENT_SUM=$(checksum_files)
 
-# === Cache hit: load directly, skip parser ===
-CACHE_HIT=0
 if [ -f "$CACHE_SUM" ] && [ -f "$CACHE_TSV" ]; then
   STORED_SUM=$(cat "$CACHE_SUM" 2>/dev/null)
   if [ "$STORED_SUM" = "$CURRENT_SUM" ] && [ -n "$CURRENT_SUM" ]; then
@@ -73,10 +87,10 @@ if [ -f "$CACHE_SUM" ] && [ -f "$CACHE_TSV" ]; then
   fi
 fi
 
-PARSED_TSV="$TMP/parsed.tsv"
-
 if [ "$CACHE_HIT" = "1" ]; then
   cp "$CACHE_TSV" "$PARSED_TSV"
+  # touch cache.tsv so TTL fast-path resets
+  touch "$CACHE_TSV"
 else
   # === Cold path: ONE awk pass parses ALL files + extracts triggers ===
   # Reads scope/plugin lookup from PATHS_TSV via BEGIN block, then
@@ -167,6 +181,7 @@ else
   cp "$PARSED_TSV" "$CACHE_TSV" 2>/dev/null
   echo "$CURRENT_SUM" > "$CACHE_SUM" 2>/dev/null
 fi
+fi  # end CACHE_HIT != 1 cold-path
 
 # === Filter (post-cache so cache stays universal) ===
 match_filter() {
