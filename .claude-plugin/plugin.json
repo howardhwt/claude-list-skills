@@ -1,0 +1,10 @@
+{
+  "name": "list-skills",
+  "version": "4.0.0",
+  "description": "Discovery-focused /list-skills for Claude Code: groups skills by intent (shipping, debug, design, planning, AI...), surfaces branch-aware suggestions, and shows your recently-used skills inline.",
+  "author": "Howard Tam",
+  "homepage": "https://github.com/howardhwt/claude-list-skills",
+  "repository": "https://github.com/howardhwt/claude-list-skills",
+  "license": "MIT",
+  "keywords": ["claude-code", "slash-command", "skills", "discovery", "registry"]
+}
